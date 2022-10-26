@@ -1,0 +1,13 @@
+{
+  "name": "Silabs Si4467",
+  "apiVersion": "1.0.0",
+  "author": "Reto Schneider",
+  "version": "0.0.1",
+  "description": "Protocol analyzer for the Silabs Si4467 SPI communication",
+  "extensions": {
+    "Silabs Si4467": {
+      "type": "HighLevelAnalyzer",
+      "entryPoint": "si4467_analyzer.Si4467Analyzer"
+    }
+  }
+}
