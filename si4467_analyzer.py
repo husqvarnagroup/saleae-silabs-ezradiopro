@@ -1,7 +1,19 @@
 # High Level Analyzer
 # For more information and documentation, please go to https://support.saleae.com/extensions/high-level-analyzer-extensions
+import dataclasses
+from typing import List, Optional
 
-from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame
+from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame, SaleaeTime
+
+# No CTS in reply stream:
+# - FRR_A_READ
+# - FRR_B_READ
+# - FRR_C_READ
+# - FRR_D_READ
+# - READ_RX_FIFO
+
+# No reply stream:
+# - WRITE_TX_FIFO
 
 COMMANDS = {
     0x02: "POWER_UP",  # Command to power-up the device and select the operational mode and functionality.
@@ -43,43 +55,116 @@ COMMANDS = {
 }
 
 
+@dataclasses.dataclass(frozen=True)
+class Byte:
+    value: int
+    start_time: SaleaeTime
+    end_time: SaleaeTime
+
+
+@dataclasses.dataclass(frozen=True)
+class CommandDescription:
+    name: str
+    id: int
+    argument_names: List[str]
+    reply_after: int
+
+
+class Command:
+    def __init__(self, start_time: SaleaeTime):
+        self.description: Optional[CommandDescription] = None
+        self.bytes: List[Byte] = []
+        self.start_time = start_time
+
+    def add_frame(self, frame: AnalyzerFrame):
+        raise NotImplementedError
+
+    def get_result(self, end_time: SaleaeTime) -> List[AnalyzerFrame]:
+        return [AnalyzerFrame('command', self.start_time, end_time, {
+            'command_name': self.description.name if self.description else "Unknown command",
+            'payload': " ".join(f"0x{x.value:02x}" for x in self.bytes)
+        })]
+
+
+class WriteCommand(Command):
+    """ Writes data but does not read anything back itself. """
+
+    def add_frame(self, frame: AnalyzerFrame):
+        self.bytes += Byte(value=int(frame.data['mosi'][0]), start_time=frame.start_time, end_time=frame.end_time)
+
+        if len(self.bytes) == 1:
+            try:
+                self.description = COMMANDS[self.bytes[0].value]
+            except KeyError:
+                pass
+
+    def get_result(self, end_time: SaleaeTime) -> List[AnalyzerFrame]:
+        result = super(Command).get_result(end_time)
+
+        for offset, name in enumerate(self.bytes):
+            byte = self.bytes[offset]
+            result += AnalyzerFrame('command_argument', byte.start_time, byte.end_time, {
+                'name': self.description.argument_names[offset] if self.description else "Unknown argument",
+                'payload': f"0x{byte.value:02x}"
+            })
+        return result
+
+
+class ReadCommand(Command):
+    """ Sends nothing but the command ID, then reads out data. """
+
+    def add_frame(self, frame: AnalyzerFrame):
+        direction = 'mosi' if len(self.bytes) == 0 else 'miso'
+        self.bytes += Byte(value=int(frame.data[direction][0]), start_time=frame.start_time, end_time=frame.end_time)
+
+        if len(self.bytes) == 1:
+            try:
+                self.description = COMMANDS[self.bytes[0].value]
+            except KeyError:
+                pass
+
+    def get_result(self, end_time: SaleaeTime) -> List[AnalyzerFrame]:
+        result = super(Command).get_result(end_time)
+
+        for offset, name in enumerate(self.bytes):
+            byte = self.bytes[offset]
+            result += AnalyzerFrame('command_argument', byte.start_time, byte.end_time, {
+                'name': self.description.argument_names[offset] if self.description else "Unknown argument",
+                'payload': f"0x{byte.value:02x}"
+            })
+        return result
+
+
 class Si4467Analyzer(HighLevelAnalyzer):
     result_types = {
-        'si4467_command': {
+        'command': {
             'format': '{{data.command_name}}'
         }
     }
 
     def __init__(self):
-        self.transaction_start_time = None
-        self.command_id = None
-        self.bytes = []
+        self.current_command: Optional[Command] = None
 
     def decode(self, frame: AnalyzerFrame):
         if frame.type == 'enable':
-            self.transaction_start_time = frame.start_time
-            self.command_id = None
-            self.bytes = []
+            self.current_command = Command(frame.start_time)
             return
-        elif frame.type == 'disable':
+
+        if self.current_command is None:
+            return
+
+        if frame.type == 'disable':
             try:
-                result = ""
-                if self.command_id == 0x44 and len(self.bytes) == 1 and self.bytes[0] != 0xFF:
-                    result = "not yet ready"
-                result = AnalyzerFrame('si4467_command', self.transaction_start_time, frame.end_time, {
-                    'command_name': COMMANDS.get(self.command_id, "Unknown command"),
-                    'result': result,
-                    'payload': " ".join(f"0x{x:02x}" for x in self.bytes)
-                })
-            except:
-                result = None
+                return self.current_command.get_result(frame.end_time)
+            except TypeError:
                 pass
-            return result
-        elif frame.type == 'result':
-            if not self.command_id:
-                self.command_id = int(frame.data['mosi'][0])
-                return
-            if self.command_id in (0x44, 0x77, 0x50, 0x51, 0x52, 0x57):
-                self.bytes.append(int(frame.data['miso'][0]))
-            else:
-                self.bytes.append(int(frame.data['mosi'][0]))
+            return
+
+        if frame.type == 'result':
+            self.current_command.add_frame(frame)
+            self.command_id = int(frame.data['mosi'][0])
+            return
+        if self.command_id in (0x44, 0x77, 0x50, 0x51, 0x52, 0x57):
+            self.bytes.append(int(frame.data['miso'][0]))
+        else:
+            self.bytes.append(int(frame.data['mosi'][0]))
